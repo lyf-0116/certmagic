@@ -95,8 +95,56 @@ func (cfg *Config) GetCertificateWithContext(ctx context.Context, clientHello *t
 
 	// get the certificate and serve it up
 	cert, err := cfg.getCertDuringHandshake(ctx, clientHello, true)
+	if err != nil {
+		return nil, err
+	}
 
-	return &cert.Certificate, err
+	// Egress decision: certificates carrying the must-staple extension
+	// may only be served in accordance with their staple status.
+	if err := cfg.enforceMustStaple(clientHello, cert); err != nil {
+		return nil, err
+	}
+
+	return &cert.Certificate, nil
+}
+
+// enforceMustStaple decides whether cert may be served to the client,
+// based on the staple status recorded on the certificate. Certificates
+// without the must-staple extension are always servable. Certificates
+// with the extension are served only if a Good staple is attached, or
+// if the OCSP responder is known to be failing and the bounded negative
+// cache is still in effect (failing open so a responder outage does not
+// take the whole site down, while the backoff prevents a retry storm
+// against the responder). Otherwise the handshake must not complete
+// with this certificate, since clients enforcing must-staple would
+// reject it anyway.
+func (cfg *Config) enforceMustStaple(hello *tls.ClientHelloInfo, cert Certificate) error {
+	if !cert.mustStaple || cfg.OCSP.DisableStapling {
+		return nil
+	}
+
+	// a Good staple is attached: serve as usual
+	if len(cert.Certificate.OCSPStaple) > 0 && cert.ocsp != nil && cert.ocsp.Status == ocsp.Good {
+		return nil
+	}
+
+	// The certificate demands stapling, but we have no usable staple. If
+	// the responder is failing (transient) and we are inside the bounded
+	// negative-cache window, fail open for availability.
+	if cert.stapleStatus == stapleStatusFailedTransient && time.Now().Before(cert.stapleRetryAt) {
+		cfg.Logger.Warn("serving must-staple certificate without a staple because the OCSP responder is failing",
+			zap.Strings("identifiers", cert.Names),
+			zap.String("server_name", hello.ServerName),
+			zap.Time("retry_after", cert.stapleRetryAt))
+		return nil
+	}
+
+	// Otherwise (no staple and no evidence of responder trouble, or a
+	// permanent problem such as a must-staple certificate that names no
+	// OCSP server), serving this certificate would violate the
+	// must-staple contract, so the handshake must not complete with it.
+	return fmt.Errorf("certificate for %v has the must-staple extension but no valid OCSP staple (staple status: %s)",
+		cert.Names, cert.stapleStatus)
 }
 
 // getCertificateFromCache gets a certificate that matches name from the in-memory
@@ -608,22 +656,20 @@ func (cfg *Config) handshakeMaintenance(ctx context.Context, hello *tls.ClientHe
 	}
 
 	// Check OCSP staple validity
-	if cert.ocsp != nil && !freshOCSP(cert.ocsp) {
+	if (cert.ocsp != nil && !freshOCSP(cert.ocsp)) || (cert.mustStaple && len(cert.Certificate.OCSPStaple) == 0) {
 		logger.Debug("OCSP response needs refreshing",
-			zap.Int("ocsp_status", cert.ocsp.Status),
-			zap.Time("this_update", cert.ocsp.ThisUpdate),
-			zap.Time("next_update", cert.ocsp.NextUpdate))
+			zap.String("staple_status", cert.stapleStatus.String()))
 
 		err := stapleOCSP(ctx, cfg.OCSP, cfg.cachedStorage(), &cert, nil)
 		if err != nil {
 			// An error with OCSP stapling is not the end of the world, and in fact, is
 			// quite common considering not all certs have issuer URLs that support it.
-			if errors.Is(err, ErrNoOCSPServerSpecified) {
+			if errors.Is(err, ErrNoOCSPServerSpecified) || errors.Is(err, ErrOCSPBackoff) {
 				logger.Debug("stapling OCSP", zap.Error(err))
 			} else {
 				logger.Warn("stapling OCSP", zap.Error(err))
 			}
-		} else {
+		} else if cert.ocsp != nil {
 			logger.Debug("successfully stapled new OCSP response",
 				zap.Int("ocsp_status", cert.ocsp.Status),
 				zap.Time("this_update", cert.ocsp.ThisUpdate),

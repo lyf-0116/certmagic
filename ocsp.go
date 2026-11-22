@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -32,6 +33,109 @@ import (
 // ErrNoOCSPServerSpecified indicates that OCSP information could not be
 // stapled because the certificate does not support OCSP.
 var ErrNoOCSPServerSpecified = errors.New("no OCSP server specified in certificate")
+
+// ErrOCSPBackoff indicates that an OCSP fetch was not even attempted
+// because the responder recently failed and the bounded negative cache
+// ("backoff") for this certificate is still in effect.
+var ErrOCSPBackoff = errors.New("OCSP responder recently failed; backing off")
+
+// stapleStatus classifies the state of a certificate's OCSP staple.
+// Every certificate carries one so that handshake, maintenance, and
+// reload paths can make serving decisions without re-fetching.
+type stapleStatus int
+
+const (
+	// stapleStatusNone means no stapling has been attempted or no
+	// information is available.
+	stapleStatusNone stapleStatus = iota
+	// stapleStatusGood means a Good OCSP response is stapled.
+	stapleStatusGood
+	// stapleStatusRevoked means the responder reported the certificate
+	// as revoked.
+	stapleStatusRevoked
+	// stapleStatusUnknown means the responder answered, but with a
+	// status that is neither Good nor Revoked.
+	stapleStatusUnknown
+	// stapleStatusFailedTransient means the last fetch failed in a way
+	// that may succeed if retried later (responder or network trouble).
+	// A bounded negative cache applies before the next attempt.
+	stapleStatusFailedTransient
+	// stapleStatusFailedPermanent means the last fetch failed in a way
+	// that retrying cannot fix (e.g. the certificate names no OCSP
+	// server).
+	stapleStatusFailedPermanent
+)
+
+// String returns a short human-readable label for the staple status.
+func (s stapleStatus) String() string {
+	switch s {
+	case stapleStatusGood:
+		return "good"
+	case stapleStatusRevoked:
+		return "revoked"
+	case stapleStatusUnknown:
+		return "unknown"
+	case stapleStatusFailedTransient:
+		return "transient_failure"
+	case stapleStatusFailedPermanent:
+		return "permanent_failure"
+	default:
+		return "none"
+	}
+}
+
+// Bounds for the negative cache applied to transient OCSP failures:
+// retries back off exponentially from ocspBackoffBase, never exceeding
+// ocspBackoffMax, and the failure counter is capped so the schedule
+// stays bounded no matter how long the responder is down.
+const (
+	ocspBackoffBase        = time.Minute
+	ocspBackoffMax         = time.Hour
+	ocspBackoffMaxAttempts = 8
+)
+
+// recordStapleFailure notes a transient OCSP fetch failure on cert and
+// sets the time before which no further fetch should be attempted.
+func (cert *Certificate) recordStapleFailure(now time.Time) {
+	if cert.stapleAttempts < ocspBackoffMaxAttempts {
+		cert.stapleAttempts++
+	}
+	delay := ocspBackoffBase << (cert.stapleAttempts - 1)
+	if delay > ocspBackoffMax {
+		delay = ocspBackoffMax
+	}
+	cert.stapleRetryAt = now.Add(delay)
+}
+
+// resetStapleBackoff clears the negative cache for cert, e.g. after a
+// successful response from the OCSP responder.
+func (cert *Certificate) resetStapleBackoff() {
+	cert.stapleAttempts = 0
+	cert.stapleRetryAt = time.Time{}
+}
+
+// hasMustStaple returns true if the certificate carries the must-staple
+// (status_request) TLS feature extension, RFC 7633.
+func hasMustStaple(leaf *x509.Certificate) bool {
+	if leaf == nil {
+		return false
+	}
+	for _, ext := range leaf.Extensions {
+		if !ext.Id.Equal(tlsFeatureExtensionOID) {
+			continue
+		}
+		var features []int
+		if _, err := asn1.Unmarshal(ext.Value, &features); err != nil {
+			continue
+		}
+		for _, feature := range features {
+			if feature == 5 { // status_request
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // stapleOCSP staples OCSP information to cert for hostname name.
 // If you have it handy, you should pass in the PEM-encoded certificate
@@ -92,10 +196,29 @@ func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cer
 	// If we couldn't get a fresh staple by reading the cache,
 	// then we need to request it from the OCSP responder
 	if ocspResp == nil || len(ocspBytes) == 0 {
+		// Negative cache: if the responder recently failed, don't pound
+		// it on every handshake or maintenance run; wait out the bounded
+		// backoff instead.
+		if time.Now().Before(cert.stapleRetryAt) {
+			return fmt.Errorf("%w for %v (retry after %s)",
+				ErrOCSPBackoff, cert.Names, cert.stapleRetryAt.Format(time.RFC3339))
+		}
 		ocspBytes, ocspResp, ocspErr = getOCSPForCert(ocspConfig, pemBundle)
 		// An error here is not a problem because a certificate
 		// may simply not contain a link to an OCSP server.
 		if ocspErr != nil {
+			// Classify the failure: permanent problems (like a certificate
+			// that names no OCSP server) can never be fixed by retrying,
+			// whereas transient ones (responder or network trouble) get a
+			// bounded negative cache so that we neither hammer the
+			// responder nor take must-staple sites down during an outage.
+			if errors.Is(ocspErr, ErrNoOCSPServerSpecified) {
+				cert.stapleStatus = stapleStatusFailedPermanent
+				cert.resetStapleBackoff()
+			} else {
+				cert.stapleStatus = stapleStatusFailedTransient
+				cert.recordStapleFailure(time.Now())
+			}
 			// For short-lived certificates, this is fine and we can ignore
 			// logging because OCSP doesn't make much sense for them anyway.
 			if cert.Lifetime() < 7*24*time.Hour {
@@ -120,6 +243,19 @@ func stapleOCSP(ctx context.Context, ocspConfig OCSPConfig, storage Storage, cer
 	// as stapling it, which we do below only if the status is Good, but it is
 	// useful to keep with the cert in order to act on it later (like if Revoked).
 	cert.ocsp = ocspResp
+
+	// Record the staple status on the certificate so that the handshake,
+	// maintenance, and reload paths can decide how to treat it. The
+	// responder answered, so any negative-cache backoff is cleared.
+	switch ocspResp.Status {
+	case ocsp.Good:
+		cert.stapleStatus = stapleStatusGood
+	case ocsp.Revoked:
+		cert.stapleStatus = stapleStatusRevoked
+	default:
+		cert.stapleStatus = stapleStatusUnknown
+	}
+	cert.resetStapleBackoff()
 
 	// If the response is good, staple it to the certificate. If the OCSP
 	// response was not loaded from storage, we persist it for next time.

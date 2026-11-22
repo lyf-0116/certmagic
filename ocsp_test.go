@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -19,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/ocsp"
 )
 
@@ -352,6 +354,249 @@ func mustMakeCertificate(t *testing.T, cert, key string) Certificate {
 		t.Fatal("couldn't make certificate:", err)
 	}
 	return c
+}
+
+func TestHasMustStaple(t *testing.T) {
+	now := time.Now().Add(-1 * time.Hour)
+
+	issuerCert, issuerKey, issuerPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test issuer"},
+		NotBefore:             now,
+		NotAfter:              now.Add(48 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, nil, nil)
+
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "must-staple.example"},
+		DNSNames:     []string{"must-staple.example"},
+		NotBefore:    now,
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	// without the extension
+	plainCert, plainKey, plainPEM := mustIssueTestCertificate(t, tmpl, issuerCert, issuerKey)
+	if hasMustStaple(plainCert) {
+		t.Error("expected hasMustStaple to be false without the extension")
+	}
+	plainKeyPEM, err := PEMEncodePrivateKey(plainKey)
+	if err != nil {
+		t.Fatalf("encoding key: %v", err)
+	}
+	cert, err := makeCertificate(append(append([]byte{}, plainPEM...), issuerPEM...), plainKeyPEM)
+	if err != nil {
+		t.Fatalf("making certificate: %v", err)
+	}
+	if cert.mustStaple {
+		t.Error("expected mustStaple to be false on Certificate without the extension")
+	}
+
+	// with the must-staple extension
+	tmplWithExt := *tmpl
+	tmplWithExt.SerialNumber = big.NewInt(3)
+	tmplWithExt.ExtraExtensions = []pkix.Extension{mustStapleExtension}
+	msCert, msKey, msPEM := mustIssueTestCertificate(t, &tmplWithExt, issuerCert, issuerKey)
+	if !hasMustStaple(msCert) {
+		t.Error("expected hasMustStaple to be true with the must-staple extension")
+	}
+	msKeyPEM, err := PEMEncodePrivateKey(msKey)
+	if err != nil {
+		t.Fatalf("encoding key: %v", err)
+	}
+	cert, err = makeCertificate(append(append([]byte{}, msPEM...), issuerPEM...), msKeyPEM)
+	if err != nil {
+		t.Fatalf("making certificate: %v", err)
+	}
+	if !cert.mustStaple {
+		t.Error("expected mustStaple to be detected when filling Certificate from leaf")
+	}
+}
+
+func TestStapleOCSPNegativeCache(t *testing.T) {
+	ctx := context.Background()
+	storage := &FileStorage{Path: t.TempDir()}
+
+	// a responder that is down: start a server just to get a URL, then close it
+	deadResponder := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := deadResponder.URL
+	deadResponder.Close()
+
+	config := OCSPConfig{
+		ResponderOverrides: map[string]string{
+			"ocsp.example.com": deadURL,
+		},
+	}
+	bundle := []byte(certWithOCSPServer + "\n" + caCert)
+
+	cert := mustMakeCertificate(t, certWithOCSPServer, certKey)
+
+	// first attempt: transient failure is classified and negatively cached
+	err := stapleOCSP(ctx, config, storage, &cert, bundle)
+	if err == nil {
+		t.Fatal("expected error from unreachable responder")
+	}
+	if errors.Is(err, ErrOCSPBackoff) {
+		t.Error("first attempt should not be a backoff error")
+	}
+	if cert.stapleStatus != stapleStatusFailedTransient {
+		t.Errorf("expected transient failure status, got %s", cert.stapleStatus)
+	}
+	if cert.stapleAttempts != 1 {
+		t.Errorf("expected 1 recorded attempt, got %d", cert.stapleAttempts)
+	}
+	if !time.Now().Before(cert.stapleRetryAt) {
+		t.Error("expected negative cache retry time to be in the future")
+	}
+
+	// second attempt within the backoff window: no fetch is even tried
+	err = stapleOCSP(ctx, config, storage, &cert, bundle)
+	if !errors.Is(err, ErrOCSPBackoff) {
+		t.Errorf("expected ErrOCSPBackoff during negative cache window, got %v", err)
+	}
+	if cert.stapleAttempts != 1 {
+		t.Errorf("backoff should not increment attempts, got %d", cert.stapleAttempts)
+	}
+
+	// after the backoff expires, a healthy responder clears the negative cache
+	ca := mustMakeCertificate(t, caCert, caKey)
+	goodResp, err := ocsp.CreateResponse(ca.Leaf, ca.Leaf, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+	}, ca.PrivateKey.(crypto.Signer))
+	if err != nil {
+		t.Fatal("couldn't create OCSP response", err)
+	}
+	responder := startOCSPResponder(t, map[string][]byte{
+		cert.Leaf.SerialNumber.String(): goodResp,
+	})
+	t.Cleanup(responder.Close)
+	config.ResponderOverrides["ocsp.example.com"] = responder.URL
+
+	cert.stapleRetryAt = time.Now().Add(-time.Minute) // pretend the backoff expired
+	err = stapleOCSP(ctx, config, storage, &cert, bundle)
+	if err != nil {
+		t.Fatal("unexpected error after responder recovered:", err)
+	}
+	if cert.stapleStatus != stapleStatusGood {
+		t.Errorf("expected good staple status, got %s", cert.stapleStatus)
+	}
+	if cert.stapleAttempts != 0 || !cert.stapleRetryAt.IsZero() {
+		t.Error("expected negative cache to be cleared after successful fetch")
+	}
+	if !bytes.Equal(cert.Certificate.OCSPStaple, goodResp) {
+		t.Error("expected OCSP response to be stapled to certificate")
+	}
+}
+
+func TestStapleOCSPPermanentFailureClassification(t *testing.T) {
+	ctx := context.Background()
+	storage := &FileStorage{Path: t.TempDir()}
+
+	// a certificate with no OCSP server can never be stapled; the failure
+	// must be classified as permanent so nobody retries it
+	cert := mustMakeCertificate(t, certWithoutOCSPServer, certKey)
+	err := stapleOCSP(ctx, OCSPConfig{}, storage, &cert, nil)
+	if !errors.Is(err, ErrNoOCSPServerSpecified) {
+		t.Fatalf("expected ErrNoOCSPServerSpecified, got %v", err)
+	}
+	if cert.stapleStatus != stapleStatusFailedPermanent {
+		t.Errorf("expected permanent failure status, got %s", cert.stapleStatus)
+	}
+	if !cert.stapleRetryAt.IsZero() {
+		t.Error("permanent failures should not set a negative-cache retry time")
+	}
+}
+
+func TestEnforceMustStaple(t *testing.T) {
+	cfg := &Config{Logger: zap.NewNop()}
+	hello := &tls.ClientHelloInfo{ServerName: "must-staple.example"}
+
+	goodOCSP := &ocsp.Response{Status: ocsp.Good}
+
+	tests := []struct {
+		name    string
+		cert    Certificate
+		wantErr bool
+	}{
+		{
+			name: "no must-staple extension is always servable",
+			cert: Certificate{Names: []string{"plain.example"}},
+		},
+		{
+			name: "must-staple with good staple is servable",
+			cert: Certificate{
+				Names:        []string{"must-staple.example"},
+				mustStaple:   true,
+				stapleStatus: stapleStatusGood,
+				ocsp:         goodOCSP,
+				Certificate:  tls.Certificate{OCSPStaple: []byte{1, 2, 3}},
+			},
+		},
+		{
+			name: "must-staple without staple is refused",
+			cert: Certificate{
+				Names:      []string{"must-staple.example"},
+				mustStaple: true,
+			},
+			wantErr: true,
+		},
+		{
+			name: "must-staple with permanent failure is refused",
+			cert: Certificate{
+				Names:        []string{"must-staple.example"},
+				mustStaple:   true,
+				stapleStatus: stapleStatusFailedPermanent,
+			},
+			wantErr: true,
+		},
+		{
+			name: "must-staple fails open during responder outage within backoff",
+			cert: Certificate{
+				Names:         []string{"must-staple.example"},
+				mustStaple:    true,
+				stapleStatus:  stapleStatusFailedTransient,
+				stapleRetryAt: time.Now().Add(time.Minute),
+			},
+		},
+		{
+			name: "must-staple is refused after backoff expired without recovery",
+			cert: Certificate{
+				Names:         []string{"must-staple.example"},
+				mustStaple:    true,
+				stapleStatus:  stapleStatusFailedTransient,
+				stapleRetryAt: time.Now().Add(-time.Minute),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cfg.enforceMustStaple(hello, tc.cert)
+			if tc.wantErr && err == nil {
+				t.Error("expected handshake to be refused, got nil error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected certificate to be served, got error: %v", err)
+			}
+		})
+	}
+
+	// an operator who explicitly disabled stapling takes responsibility;
+	// the gate does not apply
+	cfgNoStaple := &Config{Logger: zap.NewNop(), OCSP: OCSPConfig{DisableStapling: true}}
+	err := cfgNoStaple.enforceMustStaple(hello, Certificate{
+		Names:      []string{"must-staple.example"},
+		mustStaple: true,
+	})
+	if err != nil {
+		t.Errorf("expected gate to be skipped when stapling is disabled, got %v", err)
+	}
 }
 
 func startOCSPResponder(

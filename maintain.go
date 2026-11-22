@@ -311,6 +311,7 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 	type ocspUpdate struct {
 		rawBytes []byte
 		parsed   *ocsp.Response
+		status   stapleStatus
 	}
 	type updateQueueEntry struct {
 		cert           Certificate
@@ -378,11 +379,24 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		// local cache to pick up staples refreshed by other instances
 		err := stapleOCSP(ctx, qe.cfg.OCSP, qe.cfg.groundTruthStorage(), &cert, nil)
 		if err != nil {
-			if cert.ocsp != nil {
-				// if there was no staple before, that's fine; otherwise we should log the error
-				logger.Error("stapling OCSP",
-					zap.Strings("identifiers", cert.Names),
-					zap.Error(err))
+			if !errors.Is(err, ErrOCSPBackoff) {
+				if cert.ocsp != nil {
+					// if there was no staple before, that's fine; otherwise we should log the error
+					logger.Error("stapling OCSP",
+						zap.Strings("identifiers", cert.Names),
+						zap.Error(err))
+				}
+				// persist the failure classification and negative-cache
+				// state so the bounded backoff survives until the next
+				// maintenance run instead of resetting every interval
+				certCache.mu.Lock()
+				if cached, ok := certCache.cache[certHash]; ok {
+					cached.stapleStatus = cert.stapleStatus
+					cached.stapleAttempts = cert.stapleAttempts
+					cached.stapleRetryAt = cert.stapleRetryAt
+					certCache.cache[certHash] = cached
+				}
+				certCache.mu.Unlock()
 			}
 			continue
 		}
@@ -396,7 +410,7 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 				zap.Strings("identifiers", cert.Names),
 				zap.Time("from", lastNextUpdate),
 				zap.Time("to", cert.ocsp.NextUpdate))
-			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp}
+			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp, status: cert.stapleStatus}
 		}
 
 		// If the updated staple shows that the certificate was revoked, we should immediately renew it
@@ -421,6 +435,9 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		if cert, ok := certCache.cache[certKey]; ok {
 			cert.ocsp = update.parsed
 			cert.Certificate.OCSPStaple = update.rawBytes
+			cert.stapleStatus = update.status
+			cert.stapleAttempts = 0
+			cert.stapleRetryAt = time.Time{}
 			certCache.cache[certKey] = cert
 		}
 		certCache.mu.Unlock()

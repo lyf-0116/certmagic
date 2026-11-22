@@ -52,6 +52,24 @@ type Certificate struct {
 	// most recent OCSP response we have for this certificate.
 	ocsp *ocsp.Response
 
+	// mustStaple is true if the certificate carries the must-staple
+	// (status_request) TLS feature extension (RFC 7633), meaning it
+	// should not be served without a valid OCSP staple.
+	mustStaple bool
+
+	// stapleStatus classifies the current state of this certificate's
+	// OCSP staple, as last determined by stapleOCSP.
+	stapleStatus stapleStatus
+
+	// stapleAttempts counts consecutive transient OCSP fetch failures;
+	// it drives the bounded negative cache below.
+	stapleAttempts int
+
+	// stapleRetryAt is the time before which no new OCSP fetch should
+	// be attempted for this certificate (negative cache), set after
+	// transient responder failures.
+	stapleRetryAt time.Time
+
 	// The hex-encoded hash of this cert's chain's DER bytes.
 	hash string
 
@@ -520,6 +538,9 @@ func fillCertFromLeaf(cert *Certificate, tlsCert tls.Certificate) error {
 		}
 		cert.Certificate.Leaf = leaf
 	}
+
+	// note whether the certificate demands OCSP stapling (RFC 7633)
+	cert.mustStaple = hasMustStaple(leaf)
 
 	// for convenience, we do want to assemble all the
 	// subjects on the certificate into one list
