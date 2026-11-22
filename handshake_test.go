@@ -113,6 +113,81 @@ func TestGetCertificate(t *testing.T) {
 	}
 }
 
+// TestGetCertificateLoadsEvictedManagedCert verifies that a managed
+// certificate evicted from a full cache is loaded from storage during a
+// later handshake even if the cache is no longer near capacity.
+func TestGetCertificateLoadsEvictedManagedCert(t *testing.T) {
+	const (
+		domainA = "a.evicted.example"
+		domainB = "b.evicted.example"
+		domainC = "c.evicted.example"
+	)
+
+	var cfg *Config
+	getCfg := func(Certificate) (*Config, error) { return cfg, nil }
+	certCache := NewCache(CacheOptions{
+		GetConfigForCert: getCfg,
+		Capacity:         2,
+		Logger:           defaultTestLogger,
+	})
+	defer certCache.Stop()
+
+	am := &ACMEIssuer{CA: "https://example.com/acme/directory"}
+	cfg = &Config{
+		Issuers:    []Issuer{am},
+		Storage:    &FileStorage{Path: t.TempDir()},
+		Logger:     defaultTestLogger,
+		DisableARI: true,
+		certCache:  certCache,
+	}
+	am.config = cfg
+	cfg.OCSP.DisableStapling = true
+
+	ctx := context.Background()
+	now := time.Now().Add(-time.Hour)
+	for _, domain := range []string{domainA, domainB, domainC} {
+		if err := cfg.saveCertResource(ctx, am, testIssuedCertResource(t, am, domain, now)); err != nil {
+			t.Fatalf("saving certificate for %s: %v", domain, err)
+		}
+		if _, err := cfg.CacheManagedCertificate(ctx, domain); err != nil {
+			t.Fatalf("caching certificate for %s: %v", domain, err)
+		}
+	}
+
+	var evicted string
+	for _, domain := range []string{domainA, domainB, domainC} {
+		if len(certCache.getAllMatchingCerts(domain)) == 0 {
+			evicted = domain
+			break
+		}
+	}
+	if evicted == "" {
+		t.Fatal("expected one of the managed certificates to be evicted")
+	}
+	if !certCache.hasManagedCertificateNamed(evicted) {
+		t.Fatalf("expected %s to remain in the managed index", evicted)
+	}
+
+	// The cache now has room again; only the managed index reveals that
+	// this miss is for an evicted managed certificate.
+	certCache.SetOptions(CacheOptions{
+		GetConfigForCert: getCfg,
+		Capacity:         10,
+		Logger:           defaultTestLogger,
+	})
+
+	cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{ServerName: evicted})
+	if err != nil {
+		t.Fatalf("getting evicted managed certificate during handshake: %v", err)
+	}
+	if cert.Leaf == nil {
+		t.Fatal("expected a parsed leaf certificate")
+	}
+	if len(cert.Leaf.DNSNames) == 0 || cert.Leaf.DNSNames[0] != evicted {
+		t.Fatalf("expected certificate for %s, got %v", evicted, cert.Leaf.DNSNames)
+	}
+}
+
 // TestGetCertDuringHandshakeWaiterErrorPropagation verifies that when the
 // "leader" goroutine loading/obtaining a certificate for a name fails (e.g.
 // an on-demand permission denial), the failure is propagated directly to all

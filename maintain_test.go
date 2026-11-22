@@ -158,3 +158,61 @@ func TestQueueRenewalTaskPacesRetriesItself(t *testing.T) {
 		t.Fatalf("expected a second issuance attempt once the backoff interval elapsed, got %d", issuer.calls.Load())
 	}
 }
+
+// TestRenewManagedCertificatesFindsStoredCerts verifies that maintenance
+// visits managed certificates in storage even when they were never loaded
+// into a finite in-memory cache (for example, because they were evicted).
+func TestRenewManagedCertificatesFindsStoredCerts(t *testing.T) {
+	const domain = "stored-expired.example"
+	issuer := &failingIssuer{err: fmt.Errorf("simulated issuance failure")}
+
+	var cfg *Config
+	certCache := NewCache(CacheOptions{
+		GetConfigForCert: func(Certificate) (*Config, error) { return cfg, nil },
+		Capacity:         10,
+		Logger:           defaultTestLogger,
+	})
+	defer certCache.Stop()
+
+	cfg = &Config{
+		Issuers:          []Issuer{issuer},
+		Storage:          &FileStorage{Path: t.TempDir()},
+		Logger:           defaultTestLogger,
+		DisableARI:       true,
+		ReusePrivateKeys: true,
+		certCache:        certCache,
+	}
+	cfg.OCSP.DisableStapling = true
+
+	now := time.Now()
+	_, key, certPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    now.Add(-60 * 24 * time.Hour),
+		NotAfter:     now.Add(-time.Hour),
+	}, nil, nil)
+	keyPEM, err := PEMEncodePrivateKey(key)
+	if err != nil {
+		t.Fatalf("encoding private key: %v", err)
+	}
+	if err := cfg.saveCertResource(context.Background(), issuer, CertificateResource{
+		SANs:           []string{domain},
+		CertificatePEM: certPEM,
+		PrivateKeyPEM:  keyPEM,
+		issuerKey:      issuer.IssuerKey(),
+	}); err != nil {
+		t.Fatalf("seeding stored certificate: %v", err)
+	}
+
+	jobName := "renew_" + domain
+	renewalRetrySchedule.clear(jobName)
+	t.Cleanup(func() { renewalRetrySchedule.clear(jobName) })
+
+	if err := certCache.RenewManagedCertificates(context.Background()); err != nil {
+		t.Fatalf("renewing managed certificates: %v", err)
+	}
+	if !waitUntil(time.Second, func() bool { return issuer.calls.Load() == 1 }) {
+		t.Fatalf("expected stored certificate to be queued for renewal, got %d attempts", issuer.calls.Load())
+	}
+}

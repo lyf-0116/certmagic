@@ -104,15 +104,74 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 	// write locks may be obtained during the actual operations.
 	var renewQueue, reloadQueue, deleteQueue, ariQueue certList
 
-	certCache.mu.RLock()
-	for certKey, cert := range certCache.cache {
+	// Gather managed certificates from both memory and the managed index.
+	// Certificates in the index but not in memory were evicted from a full
+	// cache; they must be loaded from storage so they are not forgotten.
+	seen := make(map[string]struct{})
+	seenNames := make(map[string]struct{})
+	var candidates []Certificate
+	addCandidate := func(cert Certificate) {
 		if !cert.managed {
+			return
+		}
+		if _, ok := seen[cert.hash]; ok {
+			return
+		}
+		seen[cert.hash] = struct{}{}
+		for _, name := range cert.Names {
+			seenNames[name] = struct{}{}
+		}
+		certCache.trackManagedCertificate(cert)
+		candidates = append(candidates, cert)
+	}
+
+	for _, cert := range certCache.getAllCerts() {
+		addCandidate(cert)
+	}
+	for _, evictedCert := range certCache.managedCertRefs() {
+		cfg, err := certCache.getConfig(evictedCert)
+		if err != nil {
+			log.Error("unable to get configuration to manage evicted certificate",
+				zap.Strings("identifiers", evictedCert.Names),
+				zap.Error(err))
+			continue
+		}
+		if cfg.OnDemand != nil {
 			continue
 		}
 
+		storedCert, err := cfg.loadManagedCertificate(ctx, evictedCert.Names[0], cfg.groundTruthStorage())
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				certCache.untrackManagedCertificate(evictedCert.hash)
+			}
+			log.Warn("unable to load evicted managed certificate from storage",
+				zap.Strings("identifiers", evictedCert.Names),
+				zap.String("hash", evictedCert.hash),
+				zap.Error(err))
+			continue
+		}
+		certCache.untrackManagedCertificate(evictedCert.hash)
+		addCandidate(storedCert)
+	}
+
+	// A finite cache can only hold a subset of managed certificates, so
+	// also look in storage for ones that are not in memory. This is the
+	// disk-backed part of the index: the cache keeps what it can, while
+	// maintenance still visits everything that is managed.
+	certCache.optionsMu.RLock()
+	cacheCapacity := certCache.options.Capacity
+	certCache.optionsMu.RUnlock()
+	if cacheCapacity > 0 {
+		for _, storedCert := range certCache.loadStoredManagedCertificates(ctx, log, seenNames) {
+			addCandidate(storedCert)
+		}
+	}
+
+	for _, cert := range candidates {
 		// the list of names on this cert should never be empty... programmer error?
 		if len(cert.Names) == 0 {
-			log.Warn("certificate has no names; removing from cache", zap.String("cert_key", certKey))
+			log.Warn("certificate has no names; removing from cache", zap.String("cert_hash", cert.hash))
 			deleteQueue = append(deleteQueue, cert)
 			continue
 		}
@@ -164,7 +223,6 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 			renewQueue.insert(cert)
 		}
 	}
-	certCache.mu.RUnlock()
 
 	// Update ARI, and then for any certs where the ARI window changed,
 	// be sure to queue them for renewal if necessary
@@ -220,10 +278,111 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 	certCache.mu.Lock()
 	for _, cert := range deleteQueue {
 		certCache.removeCertificate(cert)
+		certCache.untrackManagedCertificateLocked(cert.hash)
 	}
 	certCache.mu.Unlock()
 
 	return nil
+}
+
+// loadStoredManagedCertificates returns managed certificates found in
+// storage whose names are not already represented in memory. This lets
+// maintenance visit managed certificates that a finite cache cannot hold.
+func (certCache *Cache) loadStoredManagedCertificates(ctx context.Context, log *zap.Logger, skipNames map[string]struct{}) []Certificate {
+	// Storage is reached through a Config, but the cache itself does not
+	// have one. Use any certificate we already know about, falling back
+	// to an empty certificate when the cache is empty.
+	certCache.optionsMu.RLock()
+	hasConfigGetter := certCache.options.GetConfigForCert != nil
+	certCache.optionsMu.RUnlock()
+	if !hasConfigGetter {
+		return nil
+	}
+
+	var baseCfg *Config
+	for _, cert := range certCache.getAllCerts() {
+		if cfg, err := certCache.getConfig(cert); err == nil {
+			baseCfg = cfg
+			break
+		}
+	}
+	if baseCfg == nil {
+		if cfg, err := certCache.getConfig(Certificate{managed: true}); err == nil {
+			baseCfg = cfg
+		}
+	}
+	if baseCfg == nil {
+		return nil
+	}
+
+	storage := baseCfg.groundTruthStorage()
+	issuerKeys, err := storage.List(ctx, prefixCerts, false)
+	if err != nil {
+		return nil
+	}
+
+	seenSites := make(map[string]struct{})
+	var certs []Certificate
+	for _, issuerKey := range issuerKeys {
+		siteKeys, err := storage.List(ctx, issuerKey, false)
+		if err != nil {
+			log.Warn("listing stored certificate sites", zap.String("issuer_key", issuerKey), zap.Error(err))
+			continue
+		}
+		for _, siteKey := range siteKeys {
+			siteName := path.Base(siteKey)
+			if _, ok := seenSites[siteName]; ok {
+				continue
+			}
+			seenSites[siteName] = struct{}{}
+			if _, ok := skipNames[siteName]; ok {
+				continue
+			}
+
+			cfg := baseCfg
+			siteCfg, err := certCache.getConfig(Certificate{
+				Names:     []string{siteName},
+				issuerKey: path.Base(issuerKey),
+				managed:   true,
+			})
+			if err == nil {
+				cfg = siteCfg
+			}
+			// On-demand certificates are maintained by handshakes.
+			if cfg.OnDemand != nil {
+				continue
+			}
+
+			storedCert, err := cfg.loadManagedCertificate(ctx, siteName, cfg.groundTruthStorage())
+			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					log.Warn("unable to load stored managed certificate",
+						zap.String("site_key", siteName),
+						zap.Error(err))
+				}
+				continue
+			}
+			if certCache.isManagedRemoved(storedCert) {
+				continue
+			}
+
+			duplicate := false
+			for _, name := range storedCert.Names {
+				if _, ok := skipNames[name]; ok {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			for _, name := range storedCert.Names {
+				skipNames[name] = struct{}{}
+			}
+			certs = append(certs, storedCert)
+		}
+	}
+	return certs
 }
 
 func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificate, cfg *Config) error {
@@ -274,6 +433,7 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 				// loaded dynamically, remove dynamically
 				certCache.mu.Lock()
 				certCache.removeCertificate(oldCert)
+				certCache.untrackManagedCertificateLocked(oldCert.hash)
 				certCache.mu.Unlock()
 			}
 			if exhausted := renewalRetrySchedule.recordFailure(jobName, time.Now()); exhausted {
@@ -939,6 +1099,7 @@ func (cfg *Config) forceRenew(ctx context.Context, logger *zap.Logger, cert Cert
 				zap.Error(err))
 			cfg.certCache.mu.Lock()
 			cfg.certCache.removeCertificate(cert)
+			cfg.certCache.untrackManagedCertificateLocked(cert.hash)
 			cfg.certCache.mu.Unlock()
 		}
 		return cert, fmt.Errorf("unable to forcefully get new certificate for %v: %w", cert.Names, err)

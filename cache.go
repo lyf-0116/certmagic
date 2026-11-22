@@ -57,7 +57,23 @@ type Cache struct {
 	// cacheIndex is a map of SAN to cache key (cert hash)
 	cacheIndex map[string][]string
 
-	// Protects the cache and cacheIndex maps
+	// managedCerts is an index of managed certificates by hash. Unlike
+	// cache, entries are kept when a managed certificate is evicted for
+	// capacity reasons, so maintenance can find it again in storage.
+	managedCerts map[string]managedCertRef
+
+	// managedNames maps a SAN to the hashes in managedCerts. It is kept
+	// in sync with managedCerts so handshakes can tell whether a cache
+	// miss is for a managed certificate that was evicted.
+	managedNames map[string]map[string]struct{}
+
+	// removedManaged records managed names that were explicitly removed,
+	// mapping each name to the issuers it was removed from. Maintenance
+	// consults it so its storage scan doesn't revive removed certificates.
+	removedManaged map[string]map[string]struct{}
+
+	// Protects the cache, cacheIndex, managedCerts, managedNames, and
+	// removedManaged maps
 	mu sync.RWMutex
 
 	// Close this channel to cancel asset maintenance
@@ -67,6 +83,13 @@ type Cache struct {
 	doneChan chan struct{}
 
 	logger *zap.Logger
+}
+
+// managedCertRef is the small amount of metadata needed
+// to find an evicted managed certificate in storage again.
+type managedCertRef struct {
+	names     []string
+	issuerKey string
 }
 
 // NewCache returns a new, valid Cache for efficiently
@@ -93,11 +116,14 @@ type Cache struct {
 // any locks for other processes to unblock!
 func NewCache(opts CacheOptions) *Cache {
 	c := &Cache{
-		cache:      make(map[string]Certificate),
-		cacheIndex: make(map[string][]string),
-		stopChan:   make(chan struct{}),
-		doneChan:   make(chan struct{}),
-		logger:     opts.Logger,
+		cache:          make(map[string]Certificate),
+		cacheIndex:     make(map[string][]string),
+		managedCerts:   make(map[string]managedCertRef),
+		managedNames:   make(map[string]map[string]struct{}),
+		removedManaged: make(map[string]map[string]struct{}),
+		stopChan:       make(chan struct{}),
+		doneChan:       make(chan struct{}),
+		logger:         opts.Logger,
 	}
 
 	// absolutely do not allow a nil logger; panics galore
@@ -177,8 +203,11 @@ type CacheOptions struct {
 	RenewCheckInterval time.Duration
 
 	// Maximum number of certificates to allow in the cache.
-	// If reached, certificates will be randomly evicted to
-	// make room for new ones. 0 means unlimited.
+	// If reached, certificates will be evicted to make room for
+	// new ones. Managed certificates are preferred for eviction
+	// because they can be loaded again from storage; they remain
+	// in the managed index so maintenance can still renew them.
+	// 0 means unlimited.
 	Capacity int
 
 	// Set a logger to enable logging
@@ -210,6 +239,7 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 	// a no-op so we reuse existing cert (prevent duplication), but we do
 	// modify the cert to add tags it may be missing (see issue #211)
 	if existingCert, ok := certCache.cache[cert.hash]; ok {
+		certCache.trackManagedCertificateLocked(existingCert)
 		logMsg := "certificate already cached"
 
 		if len(cert.Tags) > 0 {
@@ -239,25 +269,7 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 	certCache.optionsMu.RUnlock()
 
 	if atCapacity {
-		// Go maps are "nondeterministic" but not actually random,
-		// so although we could just chop off the "front" of the
-		// map with less code, that is a heavily skewed eviction
-		// strategy; generating random numbers is cheap and
-		// ensures a much better distribution.
-		rnd := weakrand.IntN(cacheSize)
-		i := 0
-		for _, randomCert := range certCache.cache {
-			if i >= rnd && randomCert.managed { // don't evict manually-loaded certs
-				certCache.logger.Debug("cache full; evicting random certificate",
-					zap.Strings("removing_subjects", randomCert.Names),
-					zap.String("removing_hash", randomCert.hash),
-					zap.Strings("inserting_subjects", cert.Names),
-					zap.String("inserting_hash", cert.hash))
-				certCache.removeCertificate(randomCert)
-				break
-			}
-			i++
-		}
+		certCache.evictCertificateLocked(cert)
 	}
 
 	// store the certificate
@@ -267,6 +279,11 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 	for _, name := range cert.Names {
 		certCache.cacheIndex[name] = append(certCache.cacheIndex[name], cert.hash)
 	}
+
+	if cert.managed {
+		certCache.clearRemovedManagedLocked(cert)
+	}
+	certCache.trackManagedCertificateLocked(cert)
 
 	certCache.optionsMu.RLock()
 	certCache.logger.Debug("added certificate to cache",
@@ -278,6 +295,213 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 		zap.Int("cache_size", len(certCache.cache)),
 		zap.Int("cache_capacity", certCache.options.Capacity))
 	certCache.optionsMu.RUnlock()
+}
+
+// evictCertificateLocked makes room for inserting by evicting one
+// certificate. Managed certificates are preferred because they can be
+// loaded again from storage; manually-loaded certificates have no other
+// source. If only manually-loaded certificates are present, one of them
+// is still evicted, otherwise the cache would grow without bound.
+//
+// This function is NOT safe for concurrent use. Callers MUST first
+// acquire a write lock on certCache.mu.
+func (certCache *Cache) evictCertificateLocked(inserting Certificate) {
+	keys := make([]string, 0, len(certCache.cache))
+	for key := range certCache.cache {
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return
+	}
+
+	// Go maps are "nondeterministic" but not actually random, so start
+	// at a random offset to get a better distribution of evictions.
+	offset := weakrand.IntN(len(keys))
+
+	var evicted Certificate
+	var fallback Certificate
+	var haveEvicted, haveFallback bool
+	for i := range keys {
+		candidate := certCache.cache[keys[(offset+i)%len(keys)]]
+		if candidate.managed {
+			evicted = candidate
+			haveEvicted = true
+			break
+		}
+		if !haveFallback {
+			fallback = candidate
+			haveFallback = true
+		}
+	}
+	if !haveEvicted && haveFallback {
+		evicted = fallback
+		haveEvicted = true
+	}
+	if !haveEvicted {
+		return
+	}
+
+	certCache.logger.Debug("cache full; evicting certificate",
+		zap.Strings("removing_subjects", evicted.Names),
+		zap.Bool("removing_managed", evicted.managed),
+		zap.String("removing_hash", evicted.hash),
+		zap.Strings("inserting_subjects", inserting.Names),
+		zap.String("inserting_hash", inserting.hash))
+	certCache.removeCertificate(evicted)
+}
+
+// trackManagedCertificateLocked records a managed certificate in the
+// managed index. The entry intentionally survives capacity eviction.
+//
+// This function is NOT safe for concurrent use. Callers MUST first
+// acquire a write lock on certCache.mu.
+func (certCache *Cache) trackManagedCertificateLocked(cert Certificate) {
+	if !cert.managed || cert.hash == "" {
+		return
+	}
+	if certCache.managedCerts == nil {
+		certCache.managedCerts = make(map[string]managedCertRef)
+	}
+	if certCache.managedNames == nil {
+		certCache.managedNames = make(map[string]map[string]struct{})
+	}
+
+	ref := managedCertRef{
+		names:     append([]string(nil), cert.Names...),
+		issuerKey: cert.issuerKey,
+	}
+	certCache.managedCerts[cert.hash] = ref
+	for _, name := range ref.names {
+		hashes := certCache.managedNames[name]
+		if hashes == nil {
+			hashes = make(map[string]struct{})
+			certCache.managedNames[name] = hashes
+		}
+		hashes[cert.hash] = struct{}{}
+	}
+}
+
+// untrackManagedCertificateLocked removes hash from the managed index.
+//
+// This function is NOT safe for concurrent use. Callers MUST first
+// acquire a write lock on certCache.mu.
+func (certCache *Cache) untrackManagedCertificateLocked(hash string) {
+	ref, ok := certCache.managedCerts[hash]
+	if !ok {
+		return
+	}
+	for _, name := range ref.names {
+		hashes := certCache.managedNames[name]
+		delete(hashes, hash)
+		if len(hashes) == 0 {
+			delete(certCache.managedNames, name)
+		}
+	}
+	delete(certCache.managedCerts, hash)
+}
+
+// untrackManagedCertificate removes hash from the managed index.
+func (certCache *Cache) untrackManagedCertificate(hash string) {
+	certCache.mu.Lock()
+	certCache.untrackManagedCertificateLocked(hash)
+	certCache.mu.Unlock()
+}
+
+// trackManagedCertificate adds cert to the managed index.
+func (certCache *Cache) trackManagedCertificate(cert Certificate) {
+	certCache.mu.Lock()
+	certCache.trackManagedCertificateLocked(cert)
+	certCache.mu.Unlock()
+}
+
+// markManagedRemovedLocked remembers that cert was explicitly removed,
+// so maintenance does not load it back from storage.
+func (certCache *Cache) markManagedRemovedLocked(cert Certificate) {
+	if !cert.managed {
+		return
+	}
+	if certCache.removedManaged == nil {
+		certCache.removedManaged = make(map[string]map[string]struct{})
+	}
+	for _, name := range cert.Names {
+		issuers := certCache.removedManaged[name]
+		if issuers == nil {
+			issuers = make(map[string]struct{})
+			certCache.removedManaged[name] = issuers
+		}
+		issuers[cert.issuerKey] = struct{}{}
+	}
+}
+
+// clearRemovedManagedLocked forgets any explicit removal of cert, which
+// is what happens when a subject is managed again.
+func (certCache *Cache) clearRemovedManagedLocked(cert Certificate) {
+	for _, name := range cert.Names {
+		issuers := certCache.removedManaged[name]
+		delete(issuers, cert.issuerKey)
+		if len(issuers) == 0 {
+			delete(certCache.removedManaged, name)
+		}
+	}
+}
+
+// isManagedRemoved reports whether cert was explicitly removed from
+// management and should not be revived by maintenance.
+func (certCache *Cache) isManagedRemoved(cert Certificate) bool {
+	certCache.mu.RLock()
+	defer certCache.mu.RUnlock()
+	for _, name := range cert.Names {
+		if _, ok := certCache.removedManaged[name][cert.issuerKey]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// managedCertRefs returns a snapshot of managed certificates that are
+// not currently in the in-memory cache.
+func (certCache *Cache) managedCertRefs() []Certificate {
+	certCache.mu.RLock()
+	defer certCache.mu.RUnlock()
+
+	certs := make([]Certificate, 0, len(certCache.managedCerts))
+	for hash, ref := range certCache.managedCerts {
+		if _, ok := certCache.cache[hash]; ok {
+			continue
+		}
+		certs = append(certs, Certificate{
+			Names:     append([]string(nil), ref.names...),
+			hash:      hash,
+			managed:   true,
+			issuerKey: ref.issuerKey,
+		})
+	}
+	return certs
+}
+
+// hasManagedCertificateNamed reports whether name is served by a managed
+// certificate known to this cache, even if that certificate is not in
+// memory right now. Wildcards are considered.
+func (certCache *Cache) hasManagedCertificateNamed(name string) bool {
+	name = normalizedName(name)
+	if name == "" {
+		return false
+	}
+
+	certCache.mu.RLock()
+	defer certCache.mu.RUnlock()
+
+	if len(certCache.managedNames[name]) > 0 {
+		return true
+	}
+	labels := strings.Split(name, ".")
+	for i := range labels {
+		labels[i] = "*"
+		if len(certCache.managedNames[strings.Join(labels, ".")]) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // removeCertificate removes cert from the cache.
@@ -323,6 +547,7 @@ func (certCache *Cache) removeCertificate(cert Certificate) {
 func (certCache *Cache) replaceCertificate(oldCert, newCert Certificate) {
 	certCache.mu.Lock()
 	certCache.removeCertificate(oldCert)
+	certCache.untrackManagedCertificateLocked(oldCert.hash)
 	certCache.unsyncedCacheCertificate(newCert)
 	certCache.mu.Unlock()
 	certCache.logger.Info("replaced certificate in cache",
@@ -421,6 +646,25 @@ func (certCache *Cache) RemoveManaged(subjects []SubjectIssuer) {
 			}
 		}
 	}
+
+	// Evicted managed certificates are not in cache anymore, but they
+	// are still in the managed index, so remove those too.
+	certCache.mu.RLock()
+	for _, subj := range subjects {
+		for hash, ref := range certCache.managedCerts {
+			for _, name := range ref.names {
+				if name != subj.Subject {
+					continue
+				}
+				if subj.IssuerKey == "" || ref.issuerKey == subj.IssuerKey {
+					deleteQueue = append(deleteQueue, hash)
+				}
+				break
+			}
+		}
+	}
+	certCache.mu.RUnlock()
+
 	certCache.Remove(deleteQueue)
 }
 
@@ -430,7 +674,19 @@ func (certCache *Cache) Remove(hashes []string) {
 	certCache.mu.Lock()
 	for _, h := range hashes {
 		cert := certCache.cache[h]
+		if cert.hash == "" {
+			if ref, ok := certCache.managedCerts[h]; ok {
+				cert = Certificate{
+					Names:     append([]string(nil), ref.names...),
+					hash:      h,
+					managed:   true,
+					issuerKey: ref.issuerKey,
+				}
+			}
+		}
 		certCache.removeCertificate(cert)
+		certCache.markManagedRemovedLocked(cert)
+		certCache.untrackManagedCertificateLocked(h)
 	}
 	certCache.mu.Unlock()
 }

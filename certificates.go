@@ -435,6 +435,8 @@ func (cfg *Config) CacheUnmanagedCertificatePEMBytesAsReplacement(ctx context.Co
 		existingCerts := cfg.certCache.getAllMatchingCerts(san)
 		for _, existingCert := range existingCerts {
 			cfg.certCache.removeCertificate(existingCert)
+			cfg.certCache.markManagedRemovedLocked(existingCert)
+			cfg.certCache.untrackManagedCertificateLocked(existingCert.hash)
 		}
 	}
 	cfg.certCache.unsyncedCacheCertificate(cert)

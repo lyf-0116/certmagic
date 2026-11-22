@@ -383,7 +383,12 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 	cacheCapacity := float64(cfg.certCache.options.Capacity)
 	cfg.certCache.optionsMu.RUnlock()
 	cacheAlmostFull := cacheCapacity > 0 && float64(cacheSize) >= cacheCapacity*.9
-	loadDynamically := cfg.OnDemand != nil || cacheAlmostFull
+	// A managed certificate that was evicted to make room in the cache is
+	// still ours to serve, even when the cache is not almost full anymore.
+	// The managed index remembers its name, so this miss can be answered
+	// from storage instead of failing the handshake.
+	evictedManaged := cfg.certCache.hasManagedCertificateNamed(name)
+	loadDynamically := cfg.OnDemand != nil || cacheAlmostFull || evictedManaged
 
 	if loadDynamically && loadOrObtainIfNecessary {
 		// Check to see if we have one on disk
@@ -398,7 +403,7 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 			// By this point, we need to ask the CA for a certificate
 			return cfg.obtainOnDemandCertificate(ctx, hello)
 		}
-		return loadedCert, nil
+		return Certificate{}, fmt.Errorf("no certificate available for '%s': %w", name, err)
 	}
 
 	// Fall back to another certificate if there is one (either DefaultServerName or FallbackServerName)
@@ -418,7 +423,8 @@ func (cfg *Config) getCertDuringHandshake(ctx context.Context, hello *tls.Client
 		zap.Uint16s("cipher_suites", hello.CipherSuites),
 		zap.Float64("cert_cache_fill", float64(cacheSize)/cacheCapacity), // may be approximate! because we are not within the lock
 		zap.Bool("load_or_obtain_if_necessary", loadOrObtainIfNecessary),
-		zap.Bool("on_demand", cfg.OnDemand != nil))
+		zap.Bool("on_demand", cfg.OnDemand != nil),
+		zap.Bool("evicted_managed", evictedManaged))
 
 	return Certificate{}, fmt.Errorf("no certificate available for '%s'", name)
 }
@@ -770,6 +776,7 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 			// if not, remove from cache (it will be deleted from storage later)
 			cfg.certCache.mu.Lock()
 			cfg.certCache.removeCertificate(currentCert)
+			cfg.certCache.untrackManagedCertificateLocked(currentCert.hash)
 			cfg.certCache.mu.Unlock()
 			unblockWaiters()
 
