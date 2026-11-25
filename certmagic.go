@@ -414,9 +414,15 @@ type CertificateResource struct {
 	// usually provided by the issuer implementation.
 	IssuerData json.RawMessage `json:"issuer_data,omitempty"`
 
-	// The unique string identifying the issuer of the
-	// certificate; internally useful for storage access.
-	issuerKey string
+	// IssuerKey is the unique string identifying the issuer that
+	// signed this resource. It is persisted in metadata so the
+	// issuer can be compared independently of the storage path.
+	IssuerKey string `json:"issuer_key,omitempty"`
+
+	// issuerKey identifies the issuer-specific storage location
+	// from which this resource was loaded. It is not serialized;
+	// IssuerKey is the persisted identity.
+	issuerKey string `json:"-"`
 }
 
 // NamesKey returns the list of SANs as a single string,
@@ -432,6 +438,19 @@ func (cr *CertificateResource) NamesKey() string {
 	return result
 }
 
+// MarshalJSON persists the issuer key even when callers populated the
+// legacy internal issuerKey field directly.
+func (cr CertificateResource) MarshalJSON() ([]byte, error) {
+	type certificateResourceAlias CertificateResource
+	aliased := certificateResourceAlias(cr)
+	if aliased.IssuerKey == "" {
+		aliased.IssuerKey = cr.issuerKey
+	}
+	return json.Marshal(aliased)
+}
+
+// UnmarshalJSON accepts the concise "issuer" key as an alias for the
+// persisted issuer_key field.
 // Default contains the package defaults for the
 // various Config fields. This is used as a template
 // when creating your own Configs with New() or

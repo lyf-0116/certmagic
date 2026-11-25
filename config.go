@@ -790,6 +790,7 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 			CertificatePEM: issuedCert.Certificate,
 			PrivateKeyPEM:  privKeyPEM,
 			IssuerData:     metaJSON,
+			IssuerKey:      issuerUsed.IssuerKey(),
 			issuerKey:      issuerUsed.IssuerKey(),
 		}
 		err = cfg.saveCertResource(ctx, issuerUsed, certRes)
@@ -868,8 +869,10 @@ func (cfg *Config) reusePrivateKey(ctx context.Context, domain string) (privKey 
 }
 
 // storageHasCertResourcesAnyIssuer returns true if storage has all the
-// certificate resources in storage from any configured issuer. It checks
-// all configured issuers in order.
+// certificate resources from a configured issuer and the resource metadata
+// identifies that same issuer. It checks all configured issuers in order
+// so a valid resource from a later issuer can still be found when an
+// earlier location contains stale or inconsistent assets.
 func (cfg *Config) storageHasCertResourcesAnyIssuer(ctx context.Context, name string) bool {
 	for _, iss := range cfg.Issuers {
 		if cfg.storageHasCertResources(ctx, iss, name) {
@@ -1117,6 +1120,7 @@ func (cfg *Config) renewCert(ctx context.Context, name string, force, retry, int
 			CertificatePEM: issuedCert.Certificate,
 			PrivateKeyPEM:  certRes.PrivateKeyPEM,
 			IssuerData:     metaJSON,
+			IssuerKey:      issuerKey,
 			issuerKey:      issuerKey,
 		}
 		err = cfg.saveCertResource(ctx, issuerUsed, newCertRes)
@@ -1399,18 +1403,58 @@ func (cfg *Config) checkStorage(ctx context.Context) error {
 	return nil
 }
 
-// storageHasCertResources returns true if the storage
-// associated with cfg's certificate cache has all the
-// resources related to the certificate for domain: the
-// certificate, the private key, and the metadata.
+// storageHasCertResources returns true if the storage associated with
+// cfg's certificate cache has all the resources related to the certificate
+// for domain and the metadata's issuer identity matches issuer. Metadata
+// written before issuer keys were persisted is accepted as belonging to
+// the issuer implied by its issuer-specific storage path.
 func (cfg *Config) storageHasCertResources(ctx context.Context, issuer Issuer, domain string) bool {
 	issuerKey := issuer.IssuerKey()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	certKey := StorageKeys.SiteCert(issuerKey, domain)
 	keyKey := StorageKeys.SitePrivateKey(issuerKey, domain)
 	metaKey := StorageKeys.SiteMeta(issuerKey, domain)
-	return cfg.Storage.Exists(ctx, certKey) &&
-		cfg.Storage.Exists(ctx, keyKey) &&
-		cfg.Storage.Exists(ctx, metaKey)
+	if !cfg.Storage.Exists(ctx, certKey) ||
+		!cfg.Storage.Exists(ctx, keyKey) ||
+		!cfg.Storage.Exists(ctx, metaKey) {
+		return false
+	}
+
+	metaBytes, err := cfg.Storage.Load(ctx, metaKey)
+	if err != nil {
+		logger.Warn("could not load certificate metadata while checking issuer; will obtain a new certificate",
+			zap.String("identifier", domain),
+			zap.String("issuer_key", issuerKey),
+			zap.Error(err))
+		return false
+	}
+
+	var metadata CertificateResource
+	if err := json.Unmarshal(metaBytes, &metadata); err != nil {
+		logger.Warn("could not decode certificate metadata while checking issuer; will obtain a new certificate",
+			zap.String("identifier", domain),
+			zap.String("issuer_key", issuerKey),
+			zap.Error(err))
+		return false
+	}
+
+	switch {
+	case metadata.IssuerKey == "":
+		logger.Debug("certificate metadata has no issuer key; trusting issuer-specific storage path",
+			zap.String("identifier", domain),
+			zap.String("issuer_key", issuerKey))
+	case metadata.IssuerKey != issuerKey:
+		logger.Warn("stored certificate was issued by a different issuer than the configured storage location expects; will obtain a new certificate",
+			zap.String("identifier", domain),
+			zap.String("configured_issuer_key", issuerKey),
+			zap.String("metadata_issuer_key", metadata.IssuerKey))
+		return false
+	}
+
+	return true
 }
 
 // deleteSiteAssets deletes the folder in storage containing the

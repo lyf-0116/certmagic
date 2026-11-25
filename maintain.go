@@ -628,6 +628,8 @@ func (cfg *Config) updateARI(ctx context.Context, cert Certificate, logger *zap.
 			}
 			certResBytes, err = json.MarshalIndent(CertificateResource{
 				SANs:       cert.Names,
+				IssuerKey:  cert.issuerKey,
+				issuerKey:  cert.issuerKey,
 				IssuerData: certDataBytes,
 			}, "", "\t")
 			if err != nil {

@@ -145,12 +145,20 @@ func fastHash(input []byte) string {
 // includes the certificate file itself, the private key, and the
 // metadata file.
 func (cfg *Config) saveCertResource(ctx context.Context, issuer Issuer, cert CertificateResource) error {
+	issuerKey := issuer.IssuerKey()
+	if cert.IssuerKey == "" {
+		cert.IssuerKey = cert.issuerKey
+	}
+	if cert.IssuerKey == "" {
+		cert.IssuerKey = issuerKey
+	}
+	cert.issuerKey = issuerKey
+
 	metaBytes, err := json.MarshalIndent(cert, "", "\t")
 	if err != nil {
 		return fmt.Errorf("encoding certificate metadata: %v", err)
 	}
 
-	issuerKey := issuer.IssuerKey()
 	certKey := cert.NamesKey()
 
 	all := []keyValue{
@@ -178,7 +186,8 @@ func (cfg *Config) saveCertResource(ctx context.Context, issuer Issuer, cert Cer
 // set, the issuers after the first one holding a resource that does not need
 // renewal are not read. Callers pass the storage to load from: see
 // cachedStorage and groundTruthStorage.
-func (cfg *Config) loadCertResourceAnyIssuer(ctx context.Context, certNamesKey string, storage Storage) (CertificateResource, error) {	// we can save some extra decoding steps if there's only one issuer, since
+func (cfg *Config) loadCertResourceAnyIssuer(ctx context.Context, certNamesKey string, storage Storage) (CertificateResource, error) {
+	// we can save some extra decoding steps if there's only one issuer, since
 	// we don't need to compare potentially multiple available resources to
 	// select the best one, when there's only one choice anyway
 	if len(cfg.Issuers) == 1 {
@@ -259,7 +268,8 @@ func (cfg *Config) loadCertResourceAnyIssuer(ctx context.Context, certNamesKey s
 // A resource from the local cache that is due for renewal is read from Storage
 // instead, in case another instance already renewed it.
 func (cfg *Config) loadCertResource(ctx context.Context, issuer Issuer, certNamesKey string, storage Storage) (CertificateResource, error) {
-	certRes := CertificateResource{issuerKey: issuer.IssuerKey()}
+	issuerKey := issuer.IssuerKey()
+	certRes := CertificateResource{issuerKey: issuerKey}
 
 	// don't use the Lookup profile because we might be loading a wildcard cert which is rejected by the Lookup profile
 	normalizedName, err := idna.ToASCII(certNamesKey)
@@ -284,6 +294,16 @@ func (cfg *Config) loadCertResource(ctx context.Context, issuer Issuer, certName
 	err = json.Unmarshal(metaBytes, &certRes)
 	if err != nil {
 		return CertificateResource{}, fmt.Errorf("decoding certificate metadata: %v", err)
+	}
+
+	// Metadata written before IssuerKey was persisted does not contain
+	// the field. Its issuer-specific storage path is the best available
+	// identity and remains valid until the resource is next written.
+	if certRes.IssuerKey == "" {
+		certRes.IssuerKey = issuerKey
+	} else if certRes.IssuerKey != issuerKey {
+		return CertificateResource{}, fmt.Errorf("certificate resource metadata identifies issuer %q but was loaded from storage path for issuer %q: %w",
+			certRes.IssuerKey, issuerKey, fs.ErrNotExist)
 	}
 
 	// the local cache only learns of renewals this instance does, so a cached

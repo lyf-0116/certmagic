@@ -59,6 +59,7 @@ func TestSaveCertResource(t *testing.T) {
 		IssuerData: mustJSON(acme.Certificate{
 			URL: "https://example.com/cert",
 		}),
+		IssuerKey: am.IssuerKey(),
 		issuerKey: am.IssuerKey(),
 	}
 
