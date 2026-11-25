@@ -225,6 +225,86 @@ func TestValidateOCSPResponder(t *testing.T) {
 	}
 }
 
+func TestOCSPFreshness(t *testing.T) {
+	// A fixed validity window lets us exercise all three states without
+	// racing the wall clock: thisUpdate is 10 hours ago and nextUpdate is
+	// 10 hours from now, so the midpoint (the refresh threshold) is now.
+	thisUpdate := time.Now().Add(-10 * time.Hour)
+	nextUpdate := time.Now().Add(10 * time.Hour)
+
+	tests := []struct {
+		name        string
+		resp        *ocsp.Response
+		wantFresh   bool
+		wantExpired bool
+		wantStaleOK bool // stale (not fresh) but still valid: the middle state
+	}{
+		{
+			name: "fresh before midpoint",
+			resp: &ocsp.Response{
+				ThisUpdate: time.Now().Add(-time.Hour),
+				NextUpdate: time.Now().Add(9 * time.Hour),
+			},
+			wantFresh:   true,
+			wantExpired: false,
+		},
+		{
+			name: "stale but still valid after midpoint",
+			resp: &ocsp.Response{
+				ThisUpdate: thisUpdate,
+				NextUpdate: nextUpdate,
+			},
+			wantFresh:   false,
+			wantExpired: false,
+			wantStaleOK: true,
+		},
+		{
+			name: "expired after NextUpdate",
+			resp: &ocsp.Response{
+				ThisUpdate: time.Now().Add(-10 * time.Hour),
+				NextUpdate: time.Now().Add(-time.Hour),
+			},
+			wantFresh:   false,
+			wantExpired: true,
+		},
+		{
+			name: "expired by responder certificate before NextUpdate",
+			resp: &ocsp.Response{
+				ThisUpdate: thisUpdate,
+				NextUpdate: nextUpdate,
+				Certificate: &x509.Certificate{
+					NotAfter: time.Now().Add(-time.Hour),
+				},
+			},
+			wantFresh:   false,
+			wantExpired: true,
+		},
+		{
+			name: "no NextUpdate is never expired",
+			resp: &ocsp.Response{
+				ThisUpdate: time.Now().Add(-48 * time.Hour),
+			},
+			wantFresh:   false,
+			wantExpired: false,
+			wantStaleOK: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := freshOCSP(tc.resp); got != tc.wantFresh {
+				t.Errorf("freshOCSP = %v, want %v", got, tc.wantFresh)
+			}
+			if got := expiredOCSP(tc.resp); got != tc.wantExpired {
+				t.Errorf("expiredOCSP = %v, want %v", got, tc.wantExpired)
+			}
+			if got := !freshOCSP(tc.resp) && !expiredOCSP(tc.resp); got != tc.wantStaleOK {
+				t.Errorf("stale-but-valid state = %v, want %v", got, tc.wantStaleOK)
+			}
+		})
+	}
+}
+
 func TestStapleOCSPDelegatedResponderAuthorization(t *testing.T) {
 	now := time.Now().Add(-1 * time.Hour)
 

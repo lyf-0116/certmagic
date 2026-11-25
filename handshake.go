@@ -607,12 +607,28 @@ func (cfg *Config) handshakeMaintenance(ctx context.Context, hello *tls.ClientHe
 		return cert, nil
 	}
 
-	// Check OCSP staple validity
+	// Check OCSP staple validity. An OCSP response has three states:
+	// fresh (before the midpoint of its validity period), stale-but-valid
+	// (past the midpoint but not yet expired, so it may still be stapled
+	// while we refresh it), and expired (past NextUpdate, in which case it
+	// has no legal effect and must not be stapled at all).
 	if cert.ocsp != nil && !freshOCSP(cert.ocsp) {
-		logger.Debug("OCSP response needs refreshing",
-			zap.Int("ocsp_status", cert.ocsp.Status),
-			zap.Time("this_update", cert.ocsp.ThisUpdate),
-			zap.Time("next_update", cert.ocsp.NextUpdate))
+		stapleWasExpired := expiredOCSP(cert.ocsp)
+		if stapleWasExpired {
+			logger.Warn("OCSP response has expired; unstapling it and attempting to get a new one",
+				zap.Int("ocsp_status", cert.ocsp.Status),
+				zap.Time("this_update", cert.ocsp.ThisUpdate),
+				zap.Time("next_update", cert.ocsp.NextUpdate))
+			// Stop sending the expired response immediately. Handing an
+			// expired response to the peer is worse than sending no staple
+			// at all, since some clients hard-fail on stale responses.
+			cert.Certificate.OCSPStaple = nil
+		} else {
+			logger.Debug("OCSP response needs refreshing",
+				zap.Int("ocsp_status", cert.ocsp.Status),
+				zap.Time("this_update", cert.ocsp.ThisUpdate),
+				zap.Time("next_update", cert.ocsp.NextUpdate))
+		}
 
 		err := stapleOCSP(ctx, cfg.OCSP, cfg.cachedStorage(), &cert, nil)
 		if err != nil {
@@ -628,6 +644,13 @@ func (cfg *Config) handshakeMaintenance(ctx context.Context, hello *tls.ClientHe
 				zap.Int("ocsp_status", cert.ocsp.Status),
 				zap.Time("this_update", cert.ocsp.ThisUpdate),
 				zap.Time("next_update", cert.ocsp.NextUpdate))
+		}
+
+		// If we could not obtain a replacement and the previous response had
+		// already expired, make sure it is not re-attached or left in place:
+		// no staple is preferable to a stapled response that is already invalid.
+		if stapleWasExpired && (cert.ocsp == nil || expiredOCSP(cert.ocsp)) {
+			cert.Certificate.OCSPStaple = nil
 		}
 
 		// our copy of cert has the new OCSP staple, so replace it in the cache

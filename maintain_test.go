@@ -2,13 +2,17 @@ package certmagic
 
 import (
 	"context"
+	"crypto"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 // failingIssuer is a fake Issuer that always fails, simulating a CA
@@ -156,5 +160,93 @@ func TestQueueRenewalTaskPacesRetriesItself(t *testing.T) {
 	}
 	if !waitUntil(time.Second, func() bool { return issuer.calls.Load() == 2 }) {
 		t.Fatalf("expected a second issuance attempt once the backoff interval elapsed, got %d", issuer.calls.Load())
+	}
+}
+
+// TestUpdateOCSPStaplesClearsExpiredStaple covers the background maintenance
+// path: when the cached OCSP response has already expired and the responder
+// cannot be reached, the expired staple must be removed from the cache rather
+// than left attached to the certificate.
+func TestUpdateOCSPStaplesClearsExpiredStaple(t *testing.T) {
+	ctx := context.Background()
+
+	deadResponder, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setting up dead responder address: %v", err)
+	}
+	deadURL := "http://" + deadResponder.Addr().String()
+	deadResponder.Close()
+
+	now := time.Now()
+	issuerCert, issuerKey, _ := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(10),
+		Subject:               pkix.Name{CommonName: "maintenance issuer"},
+		NotBefore:             now.Add(-60 * 24 * time.Hour),
+		NotAfter:              now.Add(60 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, nil, nil)
+
+	leafCert, leafKey, leafPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(11),
+		Subject:      pkix.Name{CommonName: "maint-staple.example"},
+		DNSNames:     []string{"maint-staple.example"},
+		NotBefore:    now.Add(-30 * 24 * time.Hour),
+		NotAfter:     now.Add(30 * 24 * time.Hour),
+		OCSPServer:   []string{deadURL},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, issuerCert, issuerKey)
+
+	keyPEM, err := PEMEncodePrivateKey(leafKey)
+	if err != nil {
+		t.Fatalf("encoding private key: %v", err)
+	}
+	cert, err := makeCertificate(leafPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("making certificate: %v", err)
+	}
+
+	expiredResp := &ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: leafCert.SerialNumber,
+		ThisUpdate:   now.Add(-10 * time.Hour),
+		NextUpdate:   now.Add(-time.Hour),
+	}
+	rawStaple, err := ocsp.CreateResponse(issuerCert, issuerCert, *expiredResp, issuerKey.(crypto.Signer))
+	if err != nil {
+		t.Fatalf("creating OCSP response: %v", err)
+	}
+
+	cert.managed = true
+	cert.ocsp = expiredResp
+	cert.Certificate.OCSPStaple = rawStaple
+
+	certCache := &Cache{
+		cache:      make(map[string]Certificate),
+		cacheIndex: make(map[string][]string),
+		logger:     defaultTestLogger,
+	}
+	cfg := &Config{
+		Storage: &FileStorage{Path: t.TempDir()},
+		Logger:  defaultTestLogger,
+		OCSP: OCSPConfig{
+			ResponderOverrides: map[string]string{deadURL: deadURL},
+		},
+		certCache: certCache,
+	}
+	certCache.options.GetConfigForCert = func(Certificate) (*Config, error) { return cfg, nil }
+
+	certCache.cacheCertificate(cert)
+
+	certCache.updateOCSPStaples(ctx)
+
+	certCache.mu.RLock()
+	cached := certCache.cache[cert.hash]
+	certCache.mu.RUnlock()
+
+	if cached.Certificate.OCSPStaple != nil {
+		t.Error("expired OCSP staple must be cleared from the cache when the refresh fails")
 	}
 }

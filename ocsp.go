@@ -242,20 +242,46 @@ func getOCSPForCert(ocspConfig OCSPConfig, bundle []byte) ([]byte, *ocsp.Respons
 	return ocspResBytes, ocspRes, nil
 }
 
-// freshOCSP returns true if resp is still fresh,
-// meaning that it is not expedient to get an
-// updated response from the OCSP server.
-func freshOCSP(resp *ocsp.Response) bool {
+// ocspValidityEnd returns the time at which resp stops being valid. It
+// accounts for an OCSP responder certificate that expires before the
+// response's own NextUpdate, in which case the responder certificate's
+// expiration marks the end of the response's validity period.
+func ocspValidityEnd(resp *ocsp.Response) time.Time {
 	nextUpdate := resp.NextUpdate
-	// If there is an OCSP responder certificate, and it expires before the
-	// OCSP response, use its expiration date as the end of the OCSP
-	// response's validity period.
 	if resp.Certificate != nil && resp.Certificate.NotAfter.Before(nextUpdate) {
 		nextUpdate = resp.Certificate.NotAfter
 	}
+	return nextUpdate
+}
+
+// freshOCSP returns true if resp is still in the "fresh" part of its
+// validity period, meaning it is not yet expedient to get an updated
+// response from the OCSP server. Once the response is roughly halfway
+// through its validity period this returns false even though the response
+// remains legally valid until it expires; use expiredOCSP to distinguish
+// "due for refresh" from "no longer valid".
+func freshOCSP(resp *ocsp.Response) bool {
+	nextUpdate := ocspValidityEnd(resp)
 	// start checking OCSP staple about halfway through validity period for good measure
 	refreshTime := resp.ThisUpdate.Add(nextUpdate.Sub(resp.ThisUpdate) / 2)
 	return time.Now().Before(refreshTime)
+}
+
+// expiredOCSP returns true if resp has passed the end of its validity
+// period and therefore has no legal effect anymore. A response that is
+// merely due for a refresh (past the midpoint of its validity period) is
+// still valid and may continue to be stapled; an expired response must not
+// be sent during a handshake, since clients vary in how they treat stale
+// OCSP responses, from ignoring them to hard-failing the connection.
+//
+// A response without a NextUpdate (a zero time) does not define an
+// expiration point, so it is never treated as expired here.
+func expiredOCSP(resp *ocsp.Response) bool {
+	nextUpdate := ocspValidityEnd(resp)
+	if nextUpdate.IsZero() {
+		return false
+	}
+	return !time.Now().Before(nextUpdate)
 }
 
 // validateOCSPResponder enforces RFC 6960 §4.2.2.2: "Systems or applications that

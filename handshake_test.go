@@ -15,15 +15,20 @@ package certmagic
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
+	"math/big"
 	"net"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 )
 
 func TestGetCertificate(t *testing.T) {
@@ -226,4 +231,141 @@ func TestGetCertDuringHandshakeWaiterErrorPropagation(t *testing.T) {
 	if got := decisionCalls.Load(); got != 1 {
 		t.Errorf("expected exactly 1 decision-func call (leader only), got %d", got)
 	}
+}
+
+// TestHandshakeMaintenanceExpiredOCSPStaple verifies the three-state handling
+// of an OCSP response during a handshake: a response past the midpoint of its
+// validity period but not yet expired stays stapled while being refreshed,
+// whereas an expired response is unstapled even when the refresh fails.
+func TestHandshakeMaintenanceExpiredOCSPStaple(t *testing.T) {
+	ctx := context.Background()
+
+	// Point OCSP requests at a closed listener so refreshes fail deterministically.
+	deadResponder, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setting up dead responder address: %v", err)
+	}
+	deadURL := "http://" + deadResponder.Addr().String()
+	deadResponder.Close()
+
+	now := time.Now()
+	issuerCert, issuerKey, _ := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test issuer"},
+		NotBefore:             now.Add(-60 * 24 * time.Hour),
+		NotAfter:              now.Add(60 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, nil, nil)
+
+	leafCert, leafKey, leafPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "staple.example"},
+		DNSNames:     []string{"staple.example"},
+		NotBefore:    now.Add(-30 * 24 * time.Hour),
+		NotAfter:     now.Add(30 * 24 * time.Hour),
+		OCSPServer:   []string{deadURL},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, issuerCert, issuerKey)
+
+	keyPEM, err := PEMEncodePrivateKey(leafKey)
+	if err != nil {
+		t.Fatalf("encoding private key: %v", err)
+	}
+
+	// helper that builds a fresh cache/config/cert for each subtest
+	setup := func(t *testing.T, resp *ocsp.Response, rawStaple []byte) (*Config, Certificate) {
+		cache := &Cache{
+			cache:      make(map[string]Certificate),
+			cacheIndex: make(map[string][]string),
+			logger:     defaultTestLogger,
+		}
+		cfg := &Config{
+			Logger:    defaultTestLogger,
+			certCache: cache,
+			Storage:   &FileStorage{Path: t.TempDir()},
+			OCSP: OCSPConfig{
+				ResponderOverrides: map[string]string{deadURL: deadURL},
+			},
+		}
+		cert, err := makeCertificate(leafPEM, keyPEM)
+		if err != nil {
+			t.Fatalf("making certificate: %v", err)
+		}
+		cert.managed = true
+		cert.ocsp = resp
+		cert.Certificate.OCSPStaple = rawStaple
+		cache.cacheCertificate(cert)
+		return cfg, cert
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("setting up test connection: %v", err)
+	}
+	defer l.Close()
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatalf("dialing test connection: %v", err)
+	}
+	defer conn.Close()
+	hello := &tls.ClientHelloInfo{ServerName: "staple.example", Conn: conn}
+
+	makeResponse := func(thisUpdate, nextUpdate time.Time) (*ocsp.Response, []byte) {
+		parsed := &ocsp.Response{
+			Status:       ocsp.Good,
+			SerialNumber: leafCert.SerialNumber,
+			ThisUpdate:   thisUpdate,
+			NextUpdate:   nextUpdate,
+		}
+		raw, err := ocsp.CreateResponse(issuerCert, issuerCert, *parsed, issuerKey.(crypto.Signer))
+		if err != nil {
+			t.Fatalf("creating OCSP response: %v", err)
+		}
+		return parsed, raw
+	}
+
+	t.Run("expired response is unstapled when refresh fails", func(t *testing.T) {
+		resp, raw := makeResponse(now.Add(-10*time.Hour), now.Add(-time.Hour))
+		cfg, cert := setup(t, resp, raw)
+
+		maintained, err := cfg.handshakeMaintenance(ctx, hello, cert)
+		if err != nil {
+			t.Fatalf("handshakeMaintenance returned error: %v", err)
+		}
+		if maintained.Certificate.OCSPStaple != nil {
+			t.Error("expired OCSP response must not remain stapled after a failed refresh")
+		}
+
+		cfg.certCache.mu.RLock()
+		cached := cfg.certCache.cache[cert.hash]
+		cfg.certCache.mu.RUnlock()
+		if cached.Certificate.OCSPStaple != nil {
+			t.Error("expired OCSP response must be cleared from the cache as well")
+		}
+	})
+
+	t.Run("stale but valid response stays stapled when refresh fails", func(t *testing.T) {
+		// Midpoint is now; NextUpdate is an hour out, so the response is due
+		// for a refresh but still legally valid.
+		resp, raw := makeResponse(now.Add(-2*time.Hour), now.Add(2*time.Hour))
+		cfg, cert := setup(t, resp, raw)
+
+		maintained, err := cfg.handshakeMaintenance(ctx, hello, cert)
+		if err != nil {
+			t.Fatalf("handshakeMaintenance returned error: %v", err)
+		}
+		if maintained.Certificate.OCSPStaple == nil {
+			t.Error("a still-valid OCSP response should remain stapled while a refresh is attempted")
+		}
+
+		cfg.certCache.mu.RLock()
+		cached := cfg.certCache.cache[cert.hash]
+		cfg.certCache.mu.RUnlock()
+		if cached.Certificate.OCSPStaple == nil {
+			t.Error("a still-valid OCSP response should remain in the cache while a refresh is attempted")
+		}
+	})
 }

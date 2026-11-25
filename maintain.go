@@ -311,6 +311,9 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 	type ocspUpdate struct {
 		rawBytes []byte
 		parsed   *ocsp.Response
+		// clear is set when an existing, expired staple has to be removed
+		// from the cache because no valid replacement is available.
+		clear bool
 	}
 	type updateQueueEntry struct {
 		cert           Certificate
@@ -366,6 +369,14 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		cert := qe.cert
 		certHash := qe.certHash
 		lastNextUpdate := qe.lastNextUpdate
+		stapleWasExpired := cert.ocsp != nil && expiredOCSP(cert.ocsp)
+
+		if stapleWasExpired {
+			// The response on hand has already passed its validity period.
+			// Remove it up front so a failure to reach the responder cannot
+			// leave an invalid response attached to the certificate.
+			cert.Certificate.OCSPStaple = nil
+		}
 
 		if qe.cfg == nil {
 			// this is bad if this happens, probably a programmer error (oops)
@@ -384,6 +395,12 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 					zap.Strings("identifiers", cert.Names),
 					zap.Error(err))
 			}
+			if stapleWasExpired {
+				// keep the expired staple out of the cache even though the
+				// refresh failed; an absent staple is a soft failure, whereas
+				// a stapled expired response can hard-fail on some clients
+				updated[certHash] = ocspUpdate{clear: true}
+			}
 			continue
 		}
 
@@ -397,6 +414,10 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 				zap.Time("from", lastNextUpdate),
 				zap.Time("to", cert.ocsp.NextUpdate))
 			updated[certHash] = ocspUpdate{rawBytes: cert.Certificate.OCSPStaple, parsed: cert.ocsp}
+		} else if stapleWasExpired && (cert.ocsp == nil || expiredOCSP(cert.ocsp) || cert.ocsp.Status != ocsp.Good) {
+			// the replacement did not yield a good, valid staple; make sure
+			// the expired one stays cleared instead of being served again
+			updated[certHash] = ocspUpdate{clear: true}
 		}
 
 		// If the updated staple shows that the certificate was revoked, we should immediately renew it
@@ -420,7 +441,11 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		certCache.mu.Lock()
 		if cert, ok := certCache.cache[certKey]; ok {
 			cert.ocsp = update.parsed
-			cert.Certificate.OCSPStaple = update.rawBytes
+			if update.clear {
+				cert.Certificate.OCSPStaple = nil
+			} else {
+				cert.Certificate.OCSPStaple = update.rawBytes
+			}
 			certCache.cache[certKey] = cert
 		}
 		certCache.mu.Unlock()
