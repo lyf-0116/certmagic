@@ -345,6 +345,241 @@ func TestStapleOCSPDelegatedResponderAuthorization(t *testing.T) {
 	}
 }
 
+func TestStapleOCSPCachedResponseValidation(t *testing.T) {
+	ctx := context.Background()
+	cert, bundle, issuerCert, issuerKey := newOCSPTestFixture(t)
+	now := time.Now()
+
+	validResponse, err := ocsp.CreateResponse(issuerCert, issuerCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+		ThisUpdate:   now.Add(-time.Hour).UTC(),
+		NextUpdate:   now.Add(24 * time.Hour).UTC(),
+	}, issuerKey)
+	if err != nil {
+		t.Fatalf("creating valid OCSP response: %v", err)
+	}
+
+	wrongSerialResponse, err := ocsp.CreateResponse(issuerCert, issuerCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: big.NewInt(999),
+		ThisUpdate:   now.Add(-time.Hour).UTC(),
+		NextUpdate:   now.Add(24 * time.Hour).UTC(),
+	}, issuerKey)
+	if err != nil {
+		t.Fatalf("creating wrong-serial OCSP response: %v", err)
+	}
+
+	responderCert, responderKey, _ := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "unauthorized-responder.example"},
+		DNSNames:     []string{"unauthorized-responder.example"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(30 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, issuerCert, issuerKey)
+	unauthorizedResponse, err := ocsp.CreateResponse(issuerCert, responderCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+		ThisUpdate:   now.Add(-time.Hour).UTC(),
+		NextUpdate:   now.Add(24 * time.Hour).UTC(),
+		Certificate:  responderCert,
+	}, responderKey)
+	if err != nil {
+		t.Fatalf("creating unauthorized-responder OCSP response: %v", err)
+	}
+
+	tamperedResponse := append([]byte(nil), validResponse...)
+	tamperedResponse[len(tamperedResponse)-1] ^= 0x01
+
+	tests := []struct {
+		name   string
+		cached []byte
+	}{
+		{name: "tampered signature", cached: tamperedResponse},
+		{name: "unauthorized responder", cached: unauthorizedResponse},
+		{name: "wrong serial number", cached: wrongSerialResponse},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			responder := startOCSPResponder(t, map[string][]byte{
+				cert.Leaf.SerialNumber.String(): validResponse,
+			})
+			t.Cleanup(responder.Close)
+
+			storage := &recordingStorage{Storage: &FileStorage{Path: t.TempDir()}}
+			config := OCSPConfig{
+				ResponderOverrides: map[string]string{
+					"http://ocsp.example.test": responder.URL,
+				},
+			}
+			key := StorageKeys.OCSPStaple(&cert, bundle)
+			if err := storage.Store(ctx, key, tc.cached); err != nil {
+				t.Fatalf("storing cached OCSP response: %v", err)
+			}
+
+			testCert := cert
+			if err := stapleOCSP(ctx, config, storage, &testCert, bundle); err != nil {
+				t.Fatalf("stapling OCSP: %v", err)
+			}
+			if !bytes.Equal(testCert.Certificate.OCSPStaple, validResponse) {
+				t.Fatal("expected invalid cached response to be replaced with a freshly fetched response")
+			}
+
+			deleted := false
+			for _, call := range storage.calls {
+				if call.name == "Delete" && len(call.args) > 0 && call.args[0] == key {
+					deleted = true
+					break
+				}
+			}
+			if !deleted {
+				t.Fatal("expected invalid cached OCSP response to be deleted")
+			}
+		})
+	}
+}
+
+func TestStapleOCSPUsesUsableCachedResponseWhenRefreshFails(t *testing.T) {
+	ctx := context.Background()
+	cert, bundle, issuerCert, issuerKey := newOCSPTestFixture(t)
+	now := time.Now()
+
+	// This response is past the halfway refresh point, but still valid.
+	cachedResponse, err := ocsp.CreateResponse(issuerCert, issuerCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+		ThisUpdate:   now.Add(-10 * time.Hour).UTC(),
+		NextUpdate:   now.Add(2 * time.Hour).UTC(),
+	}, issuerKey)
+	if err != nil {
+		t.Fatalf("creating cached OCSP response: %v", err)
+	}
+
+	responder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(responder.Close)
+
+	config := OCSPConfig{
+		ResponderOverrides: map[string]string{
+			"http://ocsp.example.test": responder.URL,
+		},
+	}
+	storage := &recordingStorage{Storage: &FileStorage{Path: t.TempDir()}}
+	key := StorageKeys.OCSPStaple(&cert, bundle)
+	if err := storage.Store(ctx, key, cachedResponse); err != nil {
+		t.Fatalf("storing cached OCSP response: %v", err)
+	}
+
+	if err := stapleOCSP(ctx, config, storage, &cert, bundle); err != nil {
+		t.Fatalf("expected usable cached response to survive refresh failure: %v", err)
+	}
+	if !bytes.Equal(cert.Certificate.OCSPStaple, cachedResponse) {
+		t.Fatal("expected usable cached response to remain stapled")
+	}
+}
+
+func TestStapleOCSPKeepsAttachedResponseWhenRefreshFails(t *testing.T) {
+	ctx := context.Background()
+	cert, bundle, issuerCert, issuerKey := newOCSPTestFixture(t)
+	now := time.Now()
+
+	staleButUsable, err := ocsp.CreateResponse(issuerCert, issuerCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+		ThisUpdate:   now.Add(-10 * time.Hour).UTC(),
+		NextUpdate:   now.Add(2 * time.Hour).UTC(),
+	}, issuerKey)
+	if err != nil {
+		t.Fatalf("creating attached OCSP response: %v", err)
+	}
+	parsed, err := ocsp.ParseResponse(staleButUsable, issuerCert)
+	if err != nil {
+		t.Fatalf("parsing attached OCSP response: %v", err)
+	}
+	cert.ocsp = parsed
+	cert.Certificate.OCSPStaple = staleButUsable
+
+	fresh, err := ocsp.CreateResponse(issuerCert, issuerCert, ocsp.Response{
+		Status:       ocsp.Good,
+		SerialNumber: cert.Leaf.SerialNumber,
+		ThisUpdate:   now.Add(-time.Hour).UTC(),
+		NextUpdate:   now.Add(24 * time.Hour).UTC(),
+	}, issuerKey)
+	if err != nil {
+		t.Fatalf("creating cached OCSP response: %v", err)
+	}
+	tampered := append([]byte(nil), fresh...)
+	tampered[len(tampered)-1] ^= 0x01
+
+	responder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(responder.Close)
+
+	config := OCSPConfig{
+		ResponderOverrides: map[string]string{
+			"http://ocsp.example.test": responder.URL,
+		},
+	}
+	storage := &recordingStorage{Storage: &FileStorage{Path: t.TempDir()}}
+	key := StorageKeys.OCSPStaple(&cert, bundle)
+	if err := storage.Store(ctx, key, tampered); err != nil {
+		t.Fatalf("storing cached OCSP response: %v", err)
+	}
+
+	if err := stapleOCSP(ctx, config, storage, &cert, bundle); err != nil {
+		t.Fatalf("expected attached response to survive refresh failure: %v", err)
+	}
+	if !bytes.Equal(cert.Certificate.OCSPStaple, staleButUsable) {
+		t.Fatal("expected attached OCSP response to remain stapled")
+	}
+	if cert.ocsp != parsed {
+		t.Fatal("expected attached parsed OCSP response to remain unchanged")
+	}
+}
+
+func newOCSPTestFixture(t *testing.T) (Certificate, []byte, *x509.Certificate, crypto.Signer) {
+	t.Helper()
+
+	now := time.Now().Add(-time.Hour)
+	issuerCert, issuerKey, issuerPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test issuer"},
+		NotBefore:             now,
+		NotAfter:              now.Add(48 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, nil, nil)
+
+	_, issuedKey, issuedPEM := mustIssueTestCertificate(t, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "cached.example"},
+		DNSNames:     []string{"cached.example"},
+		NotBefore:    now,
+		NotAfter:     now.Add(30 * 24 * time.Hour),
+		OCSPServer:   []string{"http://ocsp.example.test"},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, issuerCert, issuerKey)
+
+	issuedKeyPEM, err := PEMEncodePrivateKey(issuedKey)
+	if err != nil {
+		t.Fatalf("encoding issued certificate key: %v", err)
+	}
+	cert, err := makeCertificate(issuedPEM, issuedKeyPEM)
+	if err != nil {
+		t.Fatalf("making issued certificate: %v", err)
+	}
+	bundle := append(append([]byte{}, issuedPEM...), issuerPEM...)
+
+	return cert, bundle, issuerCert, issuerKey
+}
+
 func mustMakeCertificate(t *testing.T, cert, key string) Certificate {
 	t.Helper()
 	c, err := makeCertificate([]byte(cert), []byte(key))
